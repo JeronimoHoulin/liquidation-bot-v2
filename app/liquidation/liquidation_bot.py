@@ -406,6 +406,12 @@ class AccountMonitor:
             vault_address (str): The address of the vault associated with the account.
         """
 
+        # Skip vaults not in the allowlist (when allowlist is configured)
+        allowlist = self.config.VAULT_ALLOWLIST
+        if allowlist and Web3.to_checksum_address(vault_address) not in allowlist:
+            logger.info("AccountMonitor: Vault %s not in allowlist, skipping.", vault_address)
+            return
+
         # If the vault is not already tracked in the list, create it
         if vault_address not in self.vaults:
             self.vaults[vault_address] = Vault(vault_address, self.config)
@@ -1116,163 +1122,88 @@ class Liquidator:
                                      violator_address: str,
                                      borrowed_asset: str,
                                      collateral_vault: Vault,
-                                     liquidator_contract: Any,
+                                     _unused: Any,
                                      config: ChainConfig) -> Tuple[Dict[str, Any], Any]:
         """
-        Calculate the potential profit from liquidating an account using a specific collateral.
+        Check whether a liquidation is available and build a direct EVC batch transaction.
+
+        The EOA calls evc.batch() to seize collateral and take on the violator's debt at a
+        discount, leaving the debt position open for manual repayment later.
+        No swap or external API is required — the vault's liquidation math guarantees
+        seized_value > repay_value whenever max_repay > 0.
 
         Args:
             vault (Vault): The vault that violator has borrowed from.
-            violator_address (str): The address of the account to potentially liquidate.
+            violator_address (str): The address of the account to liquidate.
             borrowed_asset (str): The address of the borrowed asset.
-            collateral_vault (Vault): The collatearl vault to seize. 
-            liquidator_contract (Any): The liquidator contract instance.
+            collateral_vault (Vault): The collateral vault to seize.
+            _unused: Unused (was liquidator_contract in the original implementation).
 
         Returns:
-            Dict[str, Any]: A dictionary containing transaction and liquidation profit details.
+            Tuple[Dict, Any]: Liquidation data dict and params tuple, or ({"profit": 0}, None).
         """
         collateral_vault_address = collateral_vault.address
         collateral_asset = collateral_vault.underlying_asset_address
 
         (max_repay, seized_collateral_shares) = vault.check_liquidation(violator_address,
-                                                                 collateral_vault_address,
-                                                                 config.LIQUIDATOR_EOA)
-
-        seized_collateral_assets = collateral_vault.convert_to_assets(seized_collateral_shares)
+                                                                        collateral_vault_address,
+                                                                        config.LIQUIDATOR_EOA)
 
         if max_repay == 0 or seized_collateral_shares == 0:
-            logger.info("Liquidator: Max Repay %s, Seized Collateral %s, liquidation not possible",
+            logger.info("Liquidator: max_repay=%s seized_shares=%s — liquidation not available.",
                         max_repay, seized_collateral_shares)
             return ({"profit": 0}, None)
 
-        swap_api_response = Quoter.get_swap_api_quote(
-            chain_id = config.CHAIN_ID,
-            token_in = collateral_asset,
-            token_out = borrowed_asset,
-            amount = int(seized_collateral_assets *.999),
-            min_amount_out = max_repay,
-            receiver = config.SWAPPER,
-            vault_in = collateral_vault_address,
-            account_in = config.SWAPPER,
-            account_out = config.SWAPPER,
-            swapper_mode = "0",
-            slippage = config.SWAP_SLIPPAGE,
-            deadline = int(time.time()) + config.SWAP_DEADLINE,
-            is_repay = False,
-            current_debt = max_repay,
-            target_debt = 0,
-            skip_sweep_deposit_out = True,
-            config=config
+        logger.info("Liquidator: Liquidation available for %s — max_repay=%s seized_shares=%s",
+                    violator_address, max_repay, seized_collateral_shares)
+
+        # Build direct EVC batch: enableController → enableCollateral → liquidate
+        # The EOA takes on the debt and receives collateral shares; no swap or repay here.
+        # disableController is intentionally omitted — debt stays open for manual repayment.
+        ZERO = "0x0000000000000000000000000000000000000000"
+        evc = config.evc
+        enable_ctrl = evc.encodeABI("enableController",
+                                    [config.LIQUIDATOR_EOA, vault.address])
+        enable_col  = evc.encodeABI("enableCollateral",
+                                    [config.LIQUIDATOR_EOA, collateral_vault_address])
+        liquidate   = vault.instance.encodeABI(
+            "liquidate",
+            [violator_address, collateral_vault_address, max_repay, 0]
         )
+        batch_items = [
+            (config.EVC,        ZERO,                 0, enable_ctrl),
+            (config.EVC,        ZERO,                 0, enable_col),
+            (vault.address,     config.LIQUIDATOR_EOA, 0, liquidate),
+        ]
+        suggested_gas_price = int(config.w3.eth.gas_price * 1.2)
+        liquidation_tx = evc.functions.batch(batch_items).build_transaction({
+            "chainId":  config.CHAIN_ID,
+            "from":     config.LIQUIDATOR_EOA,
+            "nonce":    config.w3.eth.get_transaction_count(config.LIQUIDATOR_EOA),
+            "gasPrice": suggested_gas_price,
+        })
 
-        if not swap_api_response:
-            return ({"profit": 0}, None)
-
-        amount_out = int(swap_api_response["amountOut"])
-        leftover_borrow = amount_out - max_repay
-
-        if borrowed_asset != config.WETH:
-            borrow_to_eth_response = Quoter.get_swap_api_quote(
-                chain_id = config.CHAIN_ID,
-                token_in = borrowed_asset,
-                token_out = config.WETH,
-                amount = leftover_borrow,
-                min_amount_out = 0,
-                receiver = config.LIQUIDATOR_EOA,
-                vault_in = vault.address,
-                account_in = config.LIQUIDATOR_EOA,
-                account_out = config.LIQUIDATOR_EOA,
-                swapper_mode = "0",
-                slippage = config.SWAP_SLIPPAGE,
-                deadline = int(time.time()) + config.SWAP_DEADLINE,
-                is_repay = False,
-                current_debt = 0,
-                target_debt = 0,
-                skip_sweep_deposit_out = True,
-                config=config
-            )
-            leftover_borrow_in_eth = int(borrow_to_eth_response["amountOut"])
-        else:
-            leftover_borrow_in_eth = leftover_borrow
-
-        time.sleep(config.API_REQUEST_DELAY)
-
-        swap_data = []
-        for _, item in enumerate(swap_api_response["swap"]["multicallItems"]):
-            swap_data.append(item["data"])
-
-        logger.info("Liquidator: Seized collateral assets: %s, output amount: %s, "
-                    "leftover_borrow: %s", seized_collateral_assets, amount_out,
-                    leftover_borrow_in_eth)
-
-        # leftover_borrow_in_eth = 1
-        if leftover_borrow_in_eth < 0:
-            logger.warning("Liquidator: Negative leftover borrow value, aborting liquidation")
-            return ({"profit": 0}, None)
-
-
-        time.sleep(config.API_REQUEST_DELAY)
+        logger.info("Liquidator: EVC batch tx built for %s — gasPrice=%s",
+                    violator_address, suggested_gas_price)
 
         params = (
-                violator_address,
-                vault.address,
-                borrowed_asset,
-                collateral_vault.address,
-                collateral_asset,
-                max_repay,
-                seized_collateral_shares,
-                config.PROFIT_RECEIVER
+            violator_address,
+            vault.address,
+            borrowed_asset,
+            collateral_vault_address,
+            collateral_asset,
+            max_repay,
+            seized_collateral_shares,
+            config.PROFIT_RECEIVER
         )
 
-        logger.info("Liquidator: Liquidation params for account %s: %s", violator_address, params)
-        logger.info("Liquidator: Liquidation swap_data for account %s: %s", violator_address, swap_data)
-
-        pyth_feed_ids = vault.pyth_feed_ids
-
-        suggested_gas_price = int(config.w3.eth.gas_price * 1.2)
-
-        if len(pyth_feed_ids)> 0:
-            logger.info("Liquidator: executing with pyth")
-            update_data = PullOracleHandler.get_pyth_update_data(pyth_feed_ids)
-            update_fee = PullOracleHandler.get_pyth_update_fee(update_data, config)
-            liquidation_tx = liquidator_contract.functions.liquidateSingleCollateralWithPythOracle(
-                params, swap_data, [update_data]
-                ).build_transaction({
-                    "chainId": config.CHAIN_ID,
-                    "from": config.LIQUIDATOR_EOA,
-                    "nonce": config.w3.eth.get_transaction_count(config.LIQUIDATOR_EOA),
-                    "value": update_fee,
-                    "gasPrice": suggested_gas_price
-                })
-        else:
-            logger.info("Liquidator: executing normally")
-
-            liquidation_tx = liquidator_contract.functions.liquidateSingleCollateral(
-                params, swap_data
-                ).build_transaction({
-                    "chainId": config.CHAIN_ID,
-                    "gasPrice": suggested_gas_price,
-                    "from": config.LIQUIDATOR_EOA,
-                    "nonce": config.w3.eth.get_transaction_count(config.LIQUIDATOR_EOA)
-                })
-        logger.info("Leftover borrow in eth: %s", leftover_borrow_in_eth)
-        logger.info("Estimated gas: %s", config.w3.eth.estimate_gas(liquidation_tx))
-        logger.info("Suggested gas price: %s", suggested_gas_price)
-        logger.info("Liquidator: Liquidation params for account %s: %s", violator_address, params)
-        logger.info("Liquidator: Liquidation swap_data for account %s: %s", violator_address, swap_data)
-
-        net_profit = leftover_borrow_in_eth - (
-            config.w3.eth.estimate_gas(liquidation_tx) * suggested_gas_price)
-
-        logger.info("Net profit: %s", net_profit)
-
         return ({
-            "tx": liquidation_tx, 
-            "profit": net_profit, 
-            "collateral_address": collateral_vault.address,
+            "tx": liquidation_tx,
+            "profit": 1,  # sentinel — vault math guarantees seized_value > repay_value
+            "collateral_address": collateral_vault_address,
             "collateral_asset": collateral_asset,
-            "leftover_borrow": leftover_borrow, 
-            "leftover_borrow_in_eth": leftover_borrow_in_eth
+            "leftover_borrow": max_repay,
+            "leftover_borrow_in_eth": 0,
         }, params)
 
     @staticmethod

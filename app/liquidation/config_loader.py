@@ -60,6 +60,12 @@ class ChainConfig:
         self.SLACK_URL = os.getenv("SLACK_WEBHOOK_URL")
         self.RISK_DASHBOARD_URL = os.getenv("RISK_DASHBOARD_URL")
 
+        raw_allowlist = os.getenv("VAULT_ALLOWLIST", "")
+        self.VAULT_ALLOWLIST = (
+            {Web3.to_checksum_address(a.strip()) for a in raw_allowlist.split(",") if a.strip()}
+            if raw_allowlist else set()
+        )
+
         # Load chain-specific RPC from env using RPC_NAME from config
         self.RPC_URL = os.getenv(self._chain["RPC_NAME"])
         if not self.RPC_URL:
