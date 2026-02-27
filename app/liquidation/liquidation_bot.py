@@ -901,25 +901,36 @@ class EVCListener:
                             start_block, end_block)
 
                 logs = self.evc_instance.events.AccountStatusCheck().get_logs(
-                    fromBlock=start_block,
-                    toBlock=end_block)
+                    from_block=start_block,
+                    to_block=end_block)
 
                 for log in logs:
                     vault_address = log["args"]["controller"]
                     account_address = log["args"]["account"]
 
-                    #if we've seen the account already and the status
+                    # if we've seen the account already and the status
                     # check is not due to changing controller
                     if account_address in seen_accounts:
-                        same_controller = self.account_monitor.accounts.get(
-                            account_address).controller.address == Web3.to_checksum_address(
-                                vault_address)
+                        acct = self.account_monitor.accounts.get(account_address)
+                        if acct is None:
+                            # The account was previously encountered in this batch but
+                            # either was filtered out (e.g. vault not in allowlist) or
+                            # failed to be created earlier. In either case we can't
+                            # compare controllers; just skip the duplicate event.
+                            logger.debug("EVCListener: Seen %s before but not present in "
+                                         "monitor.accounts, skipping", account_address)
+                            continue
+
+                        same_controller = acct.controller.address == Web3.to_checksum_address(
+                            vault_address)
 
                         if same_controller:
                             logger.info("EVCListener: Account %s already seen with "
                                         "controller %s, skipping", account_address, vault_address)
                             continue
                     else:
+                        # remember that we've processed this account (regardless of
+                        # whether it successfully made it into accounts dict)
                         seen_accounts.add(account_address)
 
                     logger.info("EVCListener: AccountStatusCheck event found for account %s "
@@ -1220,7 +1231,7 @@ class Liquidator:
 
             signed_tx = config.w3.eth.account.sign_transaction(liquidation_transaction,
                                                         config.LIQUIDATOR_EOA_PRIVATE_KEY)
-            tx_hash = config.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = config.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             tx_receipt = config.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
             liquidator_contract = config.liquidator
