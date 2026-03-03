@@ -84,12 +84,9 @@ class Vault:
                 self.last_pyth_feed_ids_update = time.time()
 
             if len(self.pyth_feed_ids) > 0:
-                logger.info("Vault: Pyth Oracle found for vault %s, "
-                            "getting account liquidity through simulation", self.address)
                 collateral_value, liability_value = PullOracleHandler.get_account_values_with_pyth_batch_simulation(
                     self, account_address, self.pyth_feed_ids, self.config)
             else:
-                logger.info("Vault: Getting account liquidity normally for vault %s", self.address)
                 (collateral_value, liability_value) = self.instance.functions.accountLiquidity(
                     Web3.to_checksum_address(account_address),
                     True
@@ -120,11 +117,6 @@ class Vault:
         Returns:
             Tuple[int, int]: A tuple containing (max_repay, seized_collateral).
         """
-        logger.info("Vault: Checking liquidation for account %s, collateral vault %s,"
-                    " liquidator address %s, borrowed asset %s",
-                    borower_address, collateral_address,
-                    liquidator_address, self.underlying_asset_address)
-
         if len(self.pyth_feed_ids) > 0:
             (max_repay, seized_collateral) = PullOracleHandler.check_liquidation_with_pyth_batch_simulation(
                 self,
@@ -177,6 +169,8 @@ class Account:
         self.current_health_score = math.inf
         self.balance = 0
         self.value_borrowed = 0
+        self.collateral_value = 0
+        self.liability_value = 0
 
 
     def update_liquidity(self) -> float:
@@ -206,17 +200,9 @@ class Account:
 
         self.value_borrowed = liability_value
         if self.controller.unit_of_account == self.config.WETH:
-            logger.info("Account: Getting a quote for %s WETH, unit of account %s",
-                        liability_value, self.controller.unit_of_account)
             self.value_borrowed = get_eth_usd_quote(liability_value, self.config)
-
-            logger.info("Account: value borrowed: %s", self.value_borrowed)
         elif self.controller.unit_of_account == self.config.BTC:
-            logger.info("Account: Getting a quote for %s BTC, unit of account %s",
-                        liability_value, self.controller.unit_of_account)
             self.value_borrowed = get_btc_usd_quote(liability_value, self.config)
-
-            logger.info("Account: value borrowed: %s", self.value_borrowed)
 
         # Special case for 0 values on balance or liability
         if liability_value == 0:
@@ -225,10 +211,11 @@ class Account:
 
 
         self.current_health_score = collateral_value / liability_value
+        self.collateral_value = collateral_value
+        self.liability_value = liability_value
 
-        logger.info("Account: %s health score: %s, Collateral Value: %s,"
-                    " Liability Value: %s", self.address, self.current_health_score,
-                    collateral_value, liability_value)
+        status = "UNHEALTHY !!!" if self.current_health_score < 1 else "healthy"
+        print(f"[HEALTH] {self.address} | score={self.current_health_score:.4f} | {status}")
         return self.current_health_score
 
     def get_time_of_next_update(self) -> float:
@@ -281,8 +268,6 @@ class Account:
         if not(self.time_of_next_update < time_of_next_update and self.time_of_next_update > time.time()):
             self.time_of_next_update = time_of_next_update
 
-        logger.info("Account: %s next update scheduled for %s", self.address,
-                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.time_of_next_update)))
         return self.time_of_next_update
 
 
@@ -365,18 +350,14 @@ class AccountMonitor:
         save_thread = threading.Thread(target=self.periodic_save)
         save_thread.start()
 
-        logger.info("AccountMonitor: Save thread started.")
-
         if self.notify:
             low_health_report_thread = threading.Thread(target=
                                                         self.periodic_report_low_health_accounts)
             low_health_report_thread.start()
-            logger.info("AccountMonitor: Low health report thread started.")
 
         while self.running:
             with self.condition:
                 while self.update_queue.empty():
-                    logger.info("AccountMonitor: Waiting for queue to be non-empty.")
                     self.condition.wait()
 
                 next_update_time, address = self.update_queue.get()
@@ -384,8 +365,6 @@ class AccountMonitor:
                 # check for special value that indicates
                 # account should be skipped & removed from queue
                 if next_update_time == -1:
-                    logger.info("AccountMonitor: %s has no position,"
-                                " skipping and removing from queue", address)
                     continue
 
                 current_time = time.time()
@@ -409,13 +388,11 @@ class AccountMonitor:
         # Skip vaults not in the allowlist (when allowlist is configured)
         allowlist = self.config.VAULT_ALLOWLIST
         if allowlist and Web3.to_checksum_address(vault_address) not in allowlist:
-            logger.info("AccountMonitor: Vault %s not in allowlist, skipping.", vault_address)
             return
 
         # If the vault is not already tracked in the list, create it
         if vault_address not in self.vaults:
             self.vaults[vault_address] = Vault(vault_address, self.config)
-            logger.info("AccountMonitor: Vault %s added to vault list.", vault_address)
 
         vault = self.vaults[vault_address]
 
@@ -424,14 +401,7 @@ class AccountMonitor:
             self.accounts[address].controller.address != vault_address):
             account = Account(address, vault, self.config)
             self.accounts[address] = account
-
-            logger.info("AccountMonitor: Adding %s to account list with controller %s.",
-                        address,
-                        vault.address)
-        else:
-            logger.info("AccountMonitor: %s already in list with controller %s.",
-                        address,
-                        vault.address)
+            print(f"[MONITOR] Account added: {address} | Vault: {vault.vault_symbol} ({vault_address})")
 
         self.update_account_liquidity(address)
 
@@ -450,26 +420,34 @@ class AccountMonitor:
                              address, exc_info=True)
                 return
 
-            logger.info("AccountMonitor: Updating %s liquidity.", address)
             prev_scheduled_time = account.time_of_next_update
 
             health_score = account.update_liquidity()
 
             if health_score < 1:
                 try:
+                    shortfall = account.liability_value - account.collateral_value
+                    print(f"\n{'='*60}")
+                    print(f"[!!!] UNHEALTHY ACCOUNT DETECTED")
+                    print(f"      Address       : {address}")
+                    print(f"      Health score  : {health_score:.4f}")
+                    print(f"      Vault         : {account.controller.vault_symbol} ({account.controller.address})")
+                    print(f"      Collateral    : {account.collateral_value} (unit of account)")
+                    print(f"      Debt          : {account.liability_value} (unit of account)")
+                    print(f"      Shortfall     : {shortfall} (unit of account)")
+                    print(f"{'='*60}\n")
+
                     if self.notify:
                         if account.address in self.recently_posted_low_value:
                             if (time.time() - self.recently_posted_low_value[account.address]
                                 < self.config.LOW_HEALTH_REPORT_INTERVAL
                                 and account.value_borrowed < self.config.SMALL_POSITION_THRESHOLD):
-                                logger.info("Skipping posting notification "
-                                            "for account %s, recently posted", address)
+                                pass
                         else:
                             try:
                                 post_unhealthy_account_on_slack(address, account.controller.address,
                                                                 health_score,
                                                                 account.value_borrowed, self.config)
-                                logger.info("Valut borrowed: %s", account.value_borrowed)
                                 if account.value_borrowed < self.config.SMALL_POSITION_THRESHOLD:
                                     self.recently_posted_low_value[account.address] = time.time()
                             except Exception as ex: # pylint: disable=broad-except
@@ -478,16 +456,27 @@ class AccountMonitor:
                                              "for account %s to slack: %s",
                                              address, ex, exc_info=True)
 
-                    logger.info("AccountMonitor: %s is unhealthy, "
-                                "checking liquidation profitability.",
-                                address)
+                    print(f"[LIQ] Simulating liquidation for {address}...")
                     (result, liquidation_data, params) = account.simulate_liquidation()
 
                     if result:
+                        max_repay = liquidation_data['leftover_borrow']
+                        seized = liquidation_data['seized_shares']
+                        underlying = liquidation_data['underlying_collateral_received']
+                        print(f"\n{'='*60}")
+                        print(f"[!!!] PROFITABLE LIQUIDATION FOUND")
+                        print(f"      Violator         : {address}")
+                        print(f"      Debt vault       : {account.controller.vault_symbol} ({account.controller.address})")
+                        print(f"      Collateral vault : {liquidation_data['collateral_address']}")
+                        print(f"      Collateral asset : {liquidation_data['collateral_asset']}")
+                        print(f"  --- P&L ---")
+                        print(f"      You repay        : {max_repay} (debt token raw)")
+                        print(f"      You receive      : {seized} shares → {underlying} underlying (raw)")
+                        print(f"      Account shortfall: {account.liability_value - account.collateral_value} (unit of account)")
+                        print(f"{'='*60}\n")
+
                         if self.notify:
                             try:
-                                logger.info("AccountMonitor: Posting liquidation notification "
-                                            "to slack for account %s.", address)
                                 post_liquidation_opportunity_on_slack(address,
                                                                       account.controller.address,
                                                                       liquidation_data, params, self.config)
@@ -501,14 +490,9 @@ class AccountMonitor:
                                 tx_hash, tx_receipt = Liquidator.execute_liquidation(
                                     liquidation_data["tx"], self.config)
                                 if tx_hash and tx_receipt:
-                                    logger.info("AccountMonitor: %s liquidated "
-                                                "on collateral %s.",
-                                                address,
-                                                liquidation_data["collateral_address"])
+                                    print(f"[!!!] LIQUIDATION EXECUTED | tx: {tx_hash}")
                                     if self.notify:
                                         try:
-                                            logger.info("AccountMonitor: Posting liquidation result"
-                                                        " to slack for account %s.", address)
                                             post_liquidation_result_on_slack(address,
                                                                             account.controller.address,
                                                                             liquidation_data,
@@ -520,17 +504,24 @@ class AccountMonitor:
                                                 address, ex, exc_info=True)
 
                                 # Update account health score after liquidation
-                                # Need to know how healthy the account is after liquidation
-                                # and if we need to liquidate again
                                 account.update_liquidity()
                             except Exception as ex: # pylint: disable=broad-except
                                 logger.error("AccountMonitor: "
                                              "Failed to execute liquidation for account %s: %s",
                                              address, ex, exc_info=True)
                     else:
-                        logger.info("AccountMonitor: "
-                                    "Account %s is unhealthy but not profitable to liquidate.",
-                                    address)
+                        shortfall = account.liability_value - account.collateral_value
+                        print(f"\n{'='*60}")
+                        print(f"[!!!] UNHEALTHY — NOT LIQUIDATABLE RIGHT NOW")
+                        print(f"      Address    : {address}")
+                        print(f"      Health     : {health_score:.4f}")
+                        print(f"      Collateral : {account.collateral_value} (unit of account)")
+                        print(f"      Debt       : {account.liability_value} (unit of account)")
+                        print(f"      Shortfall  : {shortfall} (unit of account)")
+                        print(f"      Reason     : checkLiquidation() returned max_repay=0 for all")
+                        print(f"                   collaterals — oracle may be stale or position")
+                        print(f"                   is protected by cooldown / already being seized")
+                        print(f"{'='*60}\n")
                 except Exception as ex: # pylint: disable=broad-except
                     logger.error("AccountMonitor: "
                                  "Exception simulating liquidation for account %s: %s",
@@ -540,9 +531,6 @@ class AccountMonitor:
 
             # if next update hasn't changed, means we already have a check scheduled
             if next_update_time == prev_scheduled_time:
-                logger.info("AccountMonitor: %s next update already scheduled for %s",
-                            address, time.strftime("%Y-%m-%d %H:%M:%S",
-                                                  time.localtime(next_update_time)))
                 return
 
             with self.condition:
@@ -577,10 +565,6 @@ class AccountMonitor:
                 pass
 
             self.last_saved_block = self.latest_block
-
-            logger.info("AccountMonitor: State saved at time %s up to block %s",
-                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                        self.latest_block)
         except Exception as ex: # pylint: disable=broad-except
             logger.error("AccountMonitor: Failed to save state: %s", ex, exc_info=True)
 
@@ -598,36 +582,20 @@ class AccountMonitor:
                     state = json.load(f)
 
                 self.vaults = {address: Vault(address, self.config) for address in state["vaults"]}
-                logger.info("Loaded %s vaults: %s", len(self.vaults), list(self.vaults.keys()))
-
                 self.accounts = {address: Account.from_dict(data, self.vaults, self.config)
                                  for address, data in state["accounts"].items()}
-                logger.info("Loaded %s accounts:", len(self.accounts))
-
-                for address, account in self.accounts.items():
-                    logger.info("  Account %s: Controller: %s, "
-                                "Health Score: %s, "
-                                "Next Update: %s",
-                                address,
-                                account.controller.address,
-                                account.current_health_score,
-                                time.strftime("%Y-%m-%d %H:%M:%S",
-                                time.localtime(account.time_of_next_update)))
 
                 self.rebuild_queue()
 
                 self.last_saved_block = state["last_saved_block"]
                 self.latest_block = self.last_saved_block
-                logger.info("AccountMonitor: State loaded from save"
-                            " file %s from block %s to block %s",
-                            save_path,
-                            self.config.EVC_DEPLOYMENT_BLOCK,
-                            self.latest_block)
+                print(f"[STATE] Loaded {len(self.accounts)} accounts, {len(self.vaults)} vaults "
+                      f"from saved state (up to block {self.latest_block})")
             elif not local_save:
                 # Load from remote location
                 pass
             else:
-                logger.info("AccountMonitor: No saved state found.")
+                print("[STATE] No saved state found, starting fresh.")
         except Exception as ex: # pylint: disable=broad-except
             logger.error("AccountMonitor: Failed to load state: %s", ex, exc_info=True)
 
@@ -635,28 +603,25 @@ class AccountMonitor:
         """
         Rebuild queue based on current account health
         """
-        logger.info("Rebuilding queue based on current account health")
-
         self.update_queue = queue.PriorityQueue()
         for address, account in self.accounts.items():
             try:
-                health_score = account.update_liquidity()
+                account.update_liquidity()
 
                 if account.current_health_score == math.inf:
-                    logger.info("AccountMonitor: %s has no borrow, skipping", address)
                     continue
 
-                next_update_time = account.time_of_next_update
+                # Unhealthy accounts get checked immediately, not after liq_time delay
+                if account.current_health_score < 1:
+                    next_update_time = time.time()
+                else:
+                    next_update_time = account.time_of_next_update
                 self.update_queue.put((next_update_time, address))
-                logger.info("AccountMonitor: %s added to queue"
-                            " with health score %s, next update at %s",
-                            address, health_score, time.strftime("%Y-%m-%d %H:%M:%S",
-                                                                 time.localtime(next_update_time)))
             except Exception as ex: # pylint: disable=broad-except
                 logger.error("AccountMonitor: Failed to put account %s into rebuilt queue: %s",
                              address, ex, exc_info=True)
 
-        logger.info("AccountMonitor: Queue rebuilt with %s acccounts", self.update_queue.qsize())
+        print(f"[MONITOR] Queue rebuilt with {self.update_queue.qsize()} accounts")
 
     def get_accounts_by_health_score(self):
         """
@@ -770,8 +735,12 @@ class PullOracleHandler:
             unit_of_account = vault.unit_of_account
 
             collateral_vault_list = vault.get_ltv_list()
-            asset_list = [Vault(collateral_vault, config).underlying_asset_address
-                          for collateral_vault in collateral_vault_list]
+            asset_list = []
+            for collateral_vault in collateral_vault_list:
+                try:
+                    asset_list.append(Vault(collateral_vault, config).underlying_asset_address)
+                except Exception:  # pylint: disable=broad-except
+                    pass  # skip collateral vaults that don't implement EVault interface
             asset_list.append(vault.underlying_asset_address)
 
             pyth_feed_ids = set()
@@ -785,12 +754,10 @@ class PullOracleHandler:
                 try:
                     configured_oracle_name = configured_oracle.functions.name().call()
                 except Exception as ex: # pylint: disable=broad-except
-                    logger.info("PullOracleHandler: Error calling contract for oracle"
-                                " at %s, asset %s: %s", configured_oracle_address, asset, ex)
+                    logger.error("PullOracleHandler: Error calling contract for oracle"
+                                 " at %s, asset %s: %s", configured_oracle_address, asset, ex)
                     continue
                 if configured_oracle_name == "PythOracle":
-                    logger.info("PullOracleHandler: Pyth oracle found for vault %s: "
-                                "Address - %s", vault.address, configured_oracle_address)
                     pyth_feed_ids.add(configured_oracle.functions.feedId().call().hex())
                 elif configured_oracle_name == "CrossAdapter":
                     pyth_ids = PullOracleHandler.resolve_cross_oracle(
@@ -801,6 +768,7 @@ class PullOracleHandler:
 
         except Exception as ex: # pylint: disable=broad-except
             logger.error("PullOracleHandler: Error calling contract: %s", ex, exc_info=True)
+            return []
 
     @staticmethod
     def resolve_cross_oracle(cross_oracle, config):
@@ -829,7 +797,6 @@ class PullOracleHandler:
 
     @staticmethod
     def get_pyth_update_data(feed_ids):
-        logger.info("PullOracleHandler: Getting update data for feeds: %s", feed_ids)
         pyth_url = "https://hermes.pyth.network/v2/updates/price/latest?"
         for feed_id in feed_ids:
             pyth_url += "ids[]=" + feed_id + "&"
@@ -840,7 +807,6 @@ class PullOracleHandler:
 
     @staticmethod
     def get_pyth_update_fee(update_data, config):
-        logger.info("PullOracleHandler: Getting update fee for data: %s", update_data)
         pyth = create_contract_instance(config.PYTH, config.PYTH_ABI_PATH, config)
         return pyth.functions.getUpdateFee([update_data]).call()
 
@@ -897,9 +863,6 @@ class EVCListener:
         """
         for attempt in range(max_retries):
             try:
-                logger.info("EVCListener: Scanning blocks %s to %s for AccountStatusCheck events.",
-                            start_block, end_block)
-
                 logs = self.evc_instance.events.AccountStatusCheck().get_logs(
                     from_block=start_block,
                     to_block=end_block)
@@ -913,29 +876,17 @@ class EVCListener:
                     if account_address in seen_accounts:
                         acct = self.account_monitor.accounts.get(account_address)
                         if acct is None:
-                            # The account was previously encountered in this batch but
-                            # either was filtered out (e.g. vault not in allowlist) or
-                            # failed to be created earlier. In either case we can't
-                            # compare controllers; just skip the duplicate event.
-                            logger.debug("EVCListener: Seen %s before but not present in "
-                                         "monitor.accounts, skipping", account_address)
                             continue
 
                         same_controller = acct.controller.address == Web3.to_checksum_address(
                             vault_address)
 
                         if same_controller:
-                            logger.info("EVCListener: Account %s already seen with "
-                                        "controller %s, skipping", account_address, vault_address)
                             continue
                     else:
                         # remember that we've processed this account (regardless of
                         # whether it successfully made it into accounts dict)
                         seen_accounts.add(account_address)
-
-                    logger.info("EVCListener: AccountStatusCheck event found for account %s "
-                                "with controller %s, triggering monitor update.",
-                                account_address, vault_address)
 
                     try:
                         self.account_monitor.update_account_on_status_check_event(
@@ -945,9 +896,6 @@ class EVCListener:
                         logger.error("EVCListener: Exception updating account %s "
                                      "on AccountStatusCheck event: %s",
                                      account_address, ex, exc_info=True)
-
-                logger.info("EVCListener: Finished scanning blocks %s to %s "
-                            "for AccountStatusCheck events.", start_block, end_block)
 
                 self.account_monitor.latest_block = end_block
                 return
@@ -978,9 +926,8 @@ class EVCListener:
 
             batch_block_size = self.config.BATCH_SIZE
 
-            logger.info("EVCListener: "
-                        "Starting batch scan of AccountStatusCheck events from block %s to %s.",
-                        start_block, current_block)
+            print(f"[STARTUP] Scanning EVC history: blocks {start_block} → {current_block} "
+                  f"(batch size: {batch_block_size})")
 
             seen_accounts = set()
 
@@ -995,9 +942,8 @@ class EVCListener:
 
                 time.sleep(self.config.BATCH_INTERVAL) # Sleep in between batches to avoid rate limiting
 
-            logger.info("EVCListener: "
-                        "Finished batch scan of AccountStatusCheck events from block %s to %s.",
-                        start_block, current_block)
+            print(f"[STARTUP] Historical scan complete. "
+                  f"{len(seen_accounts)} unique accounts discovered.")
 
         except Exception as ex: # pylint: disable=broad-except
             logger.error("EVCListener: "
@@ -1077,14 +1023,15 @@ class Liquidator:
         }
         max_profit_params = None
 
-        collateral_vaults = {collateral: Vault(collateral, config) for collateral in collateral_list}
+        collateral_vaults = {}
+        for collateral in collateral_list:
+            try:
+                collateral_vaults[collateral] = Vault(collateral, config)
+            except Exception:  # pylint: disable=broad-except
+                pass  # skip collateral vaults that don't implement EVault interface
 
         for collateral, collateral_vault in collateral_vaults.items():
             try:
-                logger.info("Liquidator: Checking liquidation for "
-                            "account %s, borrowed asset %s, collateral asset %s",
-                            violator_address, borrowed_asset, collateral)
-
                 liquidation_results = Liquidator.calculate_liquidation_profit(vault,
                                                                       violator_address,
                                                                       borrowed_asset,
@@ -1097,34 +1044,13 @@ class Liquidator:
                     max_profit_data = profit_data
                     max_profit_params = params
             except Exception as ex: # pylint: disable=broad-except
-                message = ("Exception simulating liquidation "
-                             f"for account {violator_address} with collateral {collateral}: {ex}")
-
-                logger.error("Liquidator: %s", message, exc_info=True)
-
-                time_of_last_post = liquidation_error_slack_cooldown.get(violator_address, 0)
-                value_borrowed = violator_account.value_borrowed
-
-                now = time.time()
-                time_elapsed = now - time_of_last_post
-                if ((value_borrowed > config.SMALL_POSITION_THRESHOLD and
-                     time_elapsed > config.ERROR_COOLDOWN)
-                    or (value_borrowed <= config.SMALL_POSITION_THRESHOLD and
-                        time_elapsed > config.SMALL_POSITION_REPORT_INTERVAL)):
-                    post_error_notification(message, config)
-                    time_of_last_post = now
-                    liquidation_error_slack_cooldown[violator_address] = time_of_last_post
+                logger.error("Liquidator: Exception simulating liquidation "
+                             "for account %s with collateral %s: %s",
+                             violator_address, collateral, ex, exc_info=True)
                 continue
 
 
         if max_profit_data["tx"]:
-            logger.info("Liquidator: Profitable liquidation found for account %s. "
-                        "Collateral: %s, Underlying Collateral Asset: %s, "
-                        "Remaining borrow asset after swap and repay: %s, "
-                        "Estimated profit in ETH: %s",
-                        violator_address, max_profit_data["collateral_address"],
-                        max_profit_data["collateral_asset"], max_profit_data["leftover_borrow"],
-                        max_profit_data["leftover_borrow_in_eth"])
             return (True, max_profit_data, max_profit_params)
         return (False, None, None)
 
@@ -1161,12 +1087,12 @@ class Liquidator:
                                                                         config.LIQUIDATOR_EOA)
 
         if max_repay == 0 or seized_collateral_shares == 0:
-            logger.info("Liquidator: max_repay=%s seized_shares=%s — liquidation not available.",
-                        max_repay, seized_collateral_shares)
             return ({"profit": 0}, None)
 
-        logger.info("Liquidator: Liquidation available for %s — max_repay=%s seized_shares=%s",
-                    violator_address, max_repay, seized_collateral_shares)
+        underlying_collateral_received = collateral_vault.convert_to_assets(seized_collateral_shares)
+        print(f"[LIQ] Liquidation available: violator={violator_address} "
+              f"| max_repay={max_repay} | seized_shares={seized_collateral_shares} "
+              f"| underlying_received={underlying_collateral_received}")
 
         # Build direct EVC batch: enableController → enableCollateral → liquidate
         # The EOA takes on the debt and receives collateral shares; no swap or repay here.
@@ -1194,9 +1120,6 @@ class Liquidator:
             "gasPrice": suggested_gas_price,
         })
 
-        logger.info("Liquidator: EVC batch tx built for %s — gasPrice=%s",
-                    violator_address, suggested_gas_price)
-
         params = (
             violator_address,
             vault.address,
@@ -1215,6 +1138,8 @@ class Liquidator:
             "collateral_asset": collateral_asset,
             "leftover_borrow": max_repay,
             "leftover_borrow_in_eth": 0,
+            "seized_shares": seized_collateral_shares,
+            "underlying_collateral_received": underlying_collateral_received,
         }, params)
 
     @staticmethod
@@ -1226,9 +1151,6 @@ class Liquidator:
             liquidation_transaction (Dict[str, Any]): The liquidation transaction details.
         """
         try:
-            logger.info("Liquidator: Executing liquidation transaction %s...",
-                        liquidation_transaction)
-
             signed_tx = config.w3.eth.account.sign_transaction(liquidation_transaction,
                                                         config.LIQUIDATOR_EOA_PRIVATE_KEY)
             tx_hash = config.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
@@ -1239,16 +1161,13 @@ class Liquidator:
             result = liquidator_contract.events.Liquidation().process_receipt(
                 tx_receipt, errors=DISCARD)
 
-            logger.info("Liquidator: Liquidation details: ")
             for event in result:
-                logger.info("Liquidator: %s", event["args"])
+                print(f"[LIQ] On-chain result: {event['args']}")
 
-            logger.info("Liquidator: Liquidation transaction executed successfully.")
             return tx_hash.hex(), tx_receipt
         except Exception as ex: # pylint: disable=broad-except
-            message = f"Unexpected error in executing liquidation: {ex}"
-            logger.error(message, exc_info=True)
-            post_error_notification(message, config)
+            logger.error("Unexpected error in executing liquidation: %s", ex, exc_info=True)
+            print(f"[ERROR] Liquidation execution failed: {ex}")
             return None, None
 
 class Quoter:
@@ -1318,5 +1237,3 @@ if __name__ == "__main__":
 
     except Exception as e: # pylint: disable=broad-except
         logger.critical("Uncaught exception: %s", e, exc_info=True)
-        error_message = f"Uncaught global exception: {e}"
-        post_error_notification(error_message)
