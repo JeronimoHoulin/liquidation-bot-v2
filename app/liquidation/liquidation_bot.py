@@ -35,8 +35,23 @@ from app.liquidation.config_loader import ChainConfig
 logger = setup_logger()
 sys.excepthook = global_exception_handler
 
+# If set, only print health/liquidation output for accounts owned by this address.
+# Useful for debugging a specific user's sub-accounts without noise from others.
+# Set via env var DEBUG_OWNER or hardcode here. Clear to monitor all accounts.
+DEBUG_OWNER = os.environ.get("DEBUG_OWNER", "0x744cee96E39852C82D877eb329378Fcdf99e83F1").lower()
+
 
 ### MAIN CODE ###
+
+def _fmt_uoa(value: int, unit_of_account: str, config) -> str:
+    """Format a raw unit-of-account integer to a human-readable string."""
+    amount = value / 1e18
+    if unit_of_account == config.WETH:
+        return f"{amount:.8f} ETH"
+    if unit_of_account == config.USD:
+        return f"${amount:.8f}"
+    return f"{amount:.8f}"
+
 
 class Vault:
     """
@@ -152,6 +167,14 @@ class Vault:
         """
         return self.instance.functions.LTVList().call()
 
+    def ltv_liquidation(self, collateral_address: str) -> int:
+        """
+        Return the liquidation LTV for a given collateral vault (uint16, 0-10000 scale where 10000=100%).
+        """
+        return self.instance.functions.LTVLiquidation(
+            Web3.to_checksum_address(collateral_address)
+        ).call()
+
 class Account:
     """
     Represents an account in the EVK System.
@@ -214,8 +237,13 @@ class Account:
         self.collateral_value = collateral_value
         self.liability_value = liability_value
 
-        status = "UNHEALTHY !!!" if self.current_health_score < 1 else "healthy"
-        print(f"[HEALTH] {self.address} | score={self.current_health_score:.4f} | {status}")
+        if not DEBUG_OWNER or self.owner.lower() == DEBUG_OWNER:
+            uoa = self.controller.unit_of_account
+            ltv_pct = (liability_value / collateral_value * 100) if collateral_value > 0 else float('inf')
+            status = "UNHEALTHY (LTV>LLTV) !!!" if self.current_health_score < 1 else "healthy"
+            print(f"[HEALTH] {self.address} | health={self.current_health_score:.4f} | LTV={ltv_pct:.1f}% | "
+                  f"debt={_fmt_uoa(liability_value, uoa, self.config)} | "
+                  f"coll={_fmt_uoa(collateral_value, uoa, self.config)} | {status}")
         return self.current_health_score
 
     def get_time_of_next_update(self) -> float:
@@ -424,17 +452,29 @@ class AccountMonitor:
 
             health_score = account.update_liquidity()
 
+            if DEBUG_OWNER and account.owner.lower() != DEBUG_OWNER:
+                # silently re-queue without printing liquidation details
+                next_update_time = account.time_of_next_update
+                if next_update_time != prev_scheduled_time:
+                    with self.condition:
+                        self.update_queue.put((next_update_time, address))
+                        self.condition.notify()
+                return
+
             if health_score < 1:
                 try:
+                    uoa = account.controller.unit_of_account
+                    ltv_pct = (account.liability_value / account.collateral_value * 100) if account.collateral_value > 0 else float('inf')
                     shortfall = account.liability_value - account.collateral_value
                     print(f"\n{'='*60}")
-                    print(f"[!!!] UNHEALTHY ACCOUNT DETECTED")
-                    print(f"      Address       : {address}")
-                    print(f"      Health score  : {health_score:.4f}")
-                    print(f"      Vault         : {account.controller.vault_symbol} ({account.controller.address})")
-                    print(f"      Collateral    : {account.collateral_value} (unit of account)")
-                    print(f"      Debt          : {account.liability_value} (unit of account)")
-                    print(f"      Shortfall     : {shortfall} (unit of account)")
+                    print(f"[!!!] UNHEALTHY ACCOUNT — LTV > LLTV (liquidation zone)")
+                    print(f"      Address    : {address}")
+                    print(f"      Vault      : {account.controller.vault_symbol} ({account.controller.address})")
+                    print(f"      Health     : {health_score:.4f}  (< 1.0 means LTV crossed LLTV)")
+                    print(f"      LTV        : {ltv_pct:.4f}%")
+                    print(f"      Collateral : {_fmt_uoa(account.collateral_value, uoa, self.config)}")
+                    print(f"      Debt       : {_fmt_uoa(account.liability_value, uoa, self.config)}")
+                    print(f"      Shortfall  : {_fmt_uoa(shortfall, uoa, self.config)}")
                     print(f"{'='*60}\n")
 
                     if self.notify:
@@ -510,18 +550,7 @@ class AccountMonitor:
                                              "Failed to execute liquidation for account %s: %s",
                                              address, ex, exc_info=True)
                     else:
-                        shortfall = account.liability_value - account.collateral_value
-                        print(f"\n{'='*60}")
-                        print(f"[!!!] UNHEALTHY — NOT LIQUIDATABLE RIGHT NOW")
-                        print(f"      Address    : {address}")
-                        print(f"      Health     : {health_score:.4f}")
-                        print(f"      Collateral : {account.collateral_value} (unit of account)")
-                        print(f"      Debt       : {account.liability_value} (unit of account)")
-                        print(f"      Shortfall  : {shortfall} (unit of account)")
-                        print(f"      Reason     : checkLiquidation() returned max_repay=0 for all")
-                        print(f"                   collaterals — oracle may be stale or position")
-                        print(f"                   is protected by cooldown / already being seized")
-                        print(f"{'='*60}\n")
+                        print(f"[LIQ] {address} — unhealthy but not currently liquidatable (see above)")
                 except Exception as ex: # pylint: disable=broad-except
                     logger.error("AccountMonitor: "
                                  "Exception simulating liquidation for account %s: %s",
@@ -1013,12 +1042,17 @@ class Liquidator:
         borrowed_asset = vault.underlying_asset_address
         liquidator_contract = config.liquidator
 
+        print(f"[LIQ] EVC collaterals for {violator_address}: {len(collateral_list)} found")
+        if not collateral_list:
+            print(f"[LIQ]   → no collateral enabled — cannot liquidate")
+            return (False, None, None)
+
         max_profit_data = {
-            "tx": None, 
+            "tx": None,
             "profit": 0,
             "collateral_address": None,
             "collateral_asset": None,
-            "leftover_borrow": 0, 
+            "leftover_borrow": 0,
             "leftover_borrow_in_eth": 0
         }
         max_profit_params = None
@@ -1028,10 +1062,46 @@ class Liquidator:
             try:
                 collateral_vaults[collateral] = Vault(collateral, config)
             except Exception:  # pylint: disable=broad-except
-                pass  # skip collateral vaults that don't implement EVault interface
+                print(f"[LIQ]   → {collateral}: not a valid EVault, skipping")
 
         for collateral, collateral_vault in collateral_vaults.items():
             try:
+                # Fetch LLTV for this collateral from the debt vault
+                try:
+                    lltv_raw = vault.ltv_liquidation(collateral)
+                    lltv_str = f"{lltv_raw / 100:.4f}%"
+                except Exception:  # pylint: disable=broad-except
+                    lltv_str = "N/A"
+
+                # Fetch violator's balance in this collateral vault + oracle price
+                try:
+                    erc20 = create_contract_instance(
+                        collateral_vault.underlying_asset_address, config.ERC20_ABI_PATH, config)
+                    decimals = erc20.functions.decimals().call()
+                    one_token = 10 ** decimals
+                    shares_balance = collateral_vault.instance.functions.balanceOf(
+                        Web3.to_checksum_address(violator_address)).call()
+                    underlying_balance = collateral_vault.convert_to_assets(shares_balance) if shares_balance > 0 else 0
+                    token_amount_str = f"{underlying_balance / one_token:.4f} {collateral_vault.vault_symbol}"
+                except Exception:  # pylint: disable=broad-except
+                    token_amount_str = "N/A"
+
+                try:
+                    oracle = create_contract_instance(vault.oracle_address, config.ORACLE_ABI_PATH, config)
+                    oracle_price_raw = oracle.functions.getQuote(
+                        one_token,
+                        Web3.to_checksum_address(collateral_vault.underlying_asset_address),
+                        Web3.to_checksum_address(vault.unit_of_account)
+                    ).call()
+                    oracle_price_str = _fmt_uoa(oracle_price_raw, vault.unit_of_account, config)
+                except Exception:  # pylint: disable=broad-except
+                    oracle_price_str = "N/A"
+
+                print(f"[LIQ]   Collateral vault : {collateral_vault.vault_symbol} ({collateral})")
+                print(f"[LIQ]   LLTV             : {lltv_str}")
+                print(f"[LIQ]   Balance          : {token_amount_str}")
+                print(f"[LIQ]   Oracle price     : {oracle_price_str} per token")
+
                 liquidation_results = Liquidator.calculate_liquidation_profit(vault,
                                                                       violator_address,
                                                                       borrowed_asset,
@@ -1047,6 +1117,7 @@ class Liquidator:
                 logger.error("Liquidator: Exception simulating liquidation "
                              "for account %s with collateral %s: %s",
                              violator_address, collateral, ex, exc_info=True)
+                print(f"[LIQ]   → exception for collateral {collateral}: {ex}")
                 continue
 
 
@@ -1087,12 +1158,13 @@ class Liquidator:
                                                                         config.LIQUIDATOR_EOA)
 
         if max_repay == 0 or seized_collateral_shares == 0:
+            print(f"[LIQ]   → checkLiquidation: max_repay={max_repay}, seized={seized_collateral_shares} "
+                  f"→ not liquidatable (bad debt or cooldown)")
             return ({"profit": 0}, None)
 
         underlying_collateral_received = collateral_vault.convert_to_assets(seized_collateral_shares)
-        print(f"[LIQ] Liquidation available: violator={violator_address} "
-              f"| max_repay={max_repay} | seized_shares={seized_collateral_shares} "
-              f"| underlying_received={underlying_collateral_received}")
+        print(f"[LIQ]   → checkLiquidation: max_repay={max_repay} | seized_shares={seized_collateral_shares} "
+              f"| underlying_received={underlying_collateral_received} → LIQUIDATABLE")
 
         # Build direct EVC batch: enableController → enableCollateral → liquidate
         # The EOA takes on the debt and receives collateral shares; no swap or repay here.
