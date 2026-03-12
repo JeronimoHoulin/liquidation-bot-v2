@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(venv/Scripts/python -c \"import web3; print\\(web3.__version__\\)\")"
+    ]
+  }
+}

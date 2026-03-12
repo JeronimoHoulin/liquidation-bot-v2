@@ -241,7 +241,7 @@ class Account:
             uoa = self.controller.unit_of_account
             ltv_pct = (liability_value / collateral_value * 100) if collateral_value > 0 else float('inf')
             status = "UNHEALTHY (LTV>LLTV) !!!" if self.current_health_score < 1 else "healthy"
-            print(f"[HEALTH] {self.address} | health={self.current_health_score:.4f} | LTV={ltv_pct:.1f}% | "
+            print(f"[HEALTH] {self.address} | health={self.current_health_score:.8f} | LTV={ltv_pct:.4f}% | "
                   f"debt={_fmt_uoa(liability_value, uoa, self.config)} | "
                   f"coll={_fmt_uoa(collateral_value, uoa, self.config)} | {status}")
         return self.current_health_score
@@ -466,16 +466,44 @@ class AccountMonitor:
                     uoa = account.controller.unit_of_account
                     ltv_pct = (account.liability_value / account.collateral_value * 100) if account.collateral_value > 0 else float('inf')
                     shortfall = account.liability_value - account.collateral_value
-                    print(f"\n{'='*60}")
-                    print(f"[!!!] UNHEALTHY ACCOUNT — LTV > LLTV (liquidation zone)")
-                    print(f"      Address    : {address}")
-                    print(f"      Vault      : {account.controller.vault_symbol} ({account.controller.address})")
-                    print(f"      Health     : {health_score:.4f}  (< 1.0 means LTV crossed LLTV)")
-                    print(f"      LTV        : {ltv_pct:.4f}%")
-                    print(f"      Collateral : {_fmt_uoa(account.collateral_value, uoa, self.config)}")
-                    print(f"      Debt       : {_fmt_uoa(account.liability_value, uoa, self.config)}")
-                    print(f"      Shortfall  : {_fmt_uoa(shortfall, uoa, self.config)}")
-                    print(f"{'='*60}\n")
+
+                    # Fetch debt token amount + oracle price for detailed logging
+                    try:
+                        debt_underlying = account.controller.instance.functions.debtOf(
+                            Web3.to_checksum_address(address)).call()
+                        debt_erc20 = create_contract_instance(
+                            account.controller.underlying_asset_address, self.config.ERC20_ABI_PATH, self.config)
+                        d_dec = debt_erc20.functions.decimals().call()
+                        d_sym = debt_erc20.functions.symbol().call()
+                        debt_token_str = f"{debt_underlying / (10**d_dec):.6f} {d_sym}"
+                        oracle = create_contract_instance(
+                            account.controller.oracle_address, self.config.ORACLE_ABI_PATH, self.config)
+                        debt_price_raw = oracle.functions.getQuote(
+                            10**d_dec,
+                            Web3.to_checksum_address(account.controller.underlying_asset_address),
+                            Web3.to_checksum_address(account.controller.unit_of_account)
+                        ).call()
+                        debt_price_str = _fmt_uoa(debt_price_raw, uoa, self.config)
+                    except Exception:  # pylint: disable=broad-except
+                        debt_token_str = "N/A"
+                        debt_price_str = "N/A"
+
+                    print(f"\n{'='*70}")
+                    print(f"[!!!] UNHEALTHY ACCOUNT — LTV > LLTV (LIQUIDATION ZONE)")
+                    print(f"{'='*70}")
+                    print(f"  Sub-account  : {address}")
+                    print(f"  Owner        : {account.owner}  (sub #{account.subaccount_number})")
+                    print(f"  Debt vault   : {account.controller.vault_symbol} ({account.controller.address})")
+                    print(f"  ── Position ──────────────────────────────────────────────")
+                    print(f"  Health score : {health_score:.8f}  (< 1.0 = undercollateralised)")
+                    print(f"  LTV          : {ltv_pct:.4f}%")
+                    print(f"  Collateral   : {_fmt_uoa(account.collateral_value, uoa, self.config)}")
+                    print(f"  Debt (value) : {_fmt_uoa(account.liability_value, uoa, self.config)}")
+                    print(f"  Shortfall    : {_fmt_uoa(shortfall, uoa, self.config)}")
+                    print(f"  ── Debt asset ────────────────────────────────────────────")
+                    print(f"  Amount owed  : {debt_token_str}  (raw: {debt_underlying if debt_token_str != 'N/A' else 'N/A'})")
+                    print(f"  Oracle price : {debt_price_str} per token")
+                    print(f"{'='*70}\n")
 
                     if self.notify:
                         if account.address in self.recently_posted_low_value:
@@ -503,17 +531,45 @@ class AccountMonitor:
                         max_repay = liquidation_data['leftover_borrow']
                         seized = liquidation_data['seized_shares']
                         underlying = liquidation_data['underlying_collateral_received']
-                        print(f"\n{'='*60}")
+                        coll_addr = liquidation_data['collateral_address']
+                        MAX_UINT256 = 2**256 - 1
+
+                        # Fetch collateral token details for readable output
+                        try:
+                            coll_vault_sym = liquidation_data.get('collateral_vault_symbol', coll_addr[:10])
+                            coll_erc20 = create_contract_instance(
+                                liquidation_data['collateral_asset'], self.config.ERC20_ABI_PATH, self.config)
+                            c_dec = coll_erc20.functions.decimals().call()
+                            c_sym = coll_erc20.functions.symbol().call()
+                            seize_str = f"{underlying / (10**c_dec):.6f} {c_sym}"
+                            d_erc20 = create_contract_instance(
+                                account.controller.underlying_asset_address, self.config.ERC20_ABI_PATH, self.config)
+                            d_dec = d_erc20.functions.decimals().call()
+                            d_sym = d_erc20.functions.symbol().call()
+                            repay_str = f"{max_repay / (10**d_dec):.6f} {d_sym}"
+                        except Exception:  # pylint: disable=broad-except
+                            seize_str = f"{underlying} (raw)"
+                            repay_str  = f"{max_repay} (raw)"
+
+                        print(f"\n{'='*70}")
                         print(f"[!!!] PROFITABLE LIQUIDATION FOUND")
-                        print(f"      Violator         : {address}")
-                        print(f"      Debt vault       : {account.controller.vault_symbol} ({account.controller.address})")
-                        print(f"      Collateral vault : {liquidation_data['collateral_address']}")
-                        print(f"      Collateral asset : {liquidation_data['collateral_asset']}")
-                        print(f"  --- P&L ---")
-                        print(f"      You repay        : {max_repay} (debt token raw)")
-                        print(f"      You receive      : {seized} shares → {underlying} underlying (raw)")
-                        print(f"      Account shortfall: {account.liability_value - account.collateral_value} (unit of account)")
-                        print(f"{'='*60}\n")
+                        print(f"{'='*70}")
+                        print(f"  Violator         : {address}")
+                        print(f"  Debt vault       : {account.controller.vault_symbol} ({account.controller.address})")
+                        print(f"  Collateral vault : {coll_addr}")
+                        print(f"  ── Expected outcome ──────────────────────────────────────")
+                        print(f"  Max repay        : {repay_str}  (raw: {max_repay})")
+                        print(f"  Seize (shares)   : {seized}")
+                        print(f"  Seize (tokens)   : {seize_str}  (raw: {underlying})")
+                        print(f"  Shortfall closed : {_fmt_uoa(account.liability_value - account.collateral_value, account.controller.unit_of_account, self.config)}")
+                        print(f"  ── Call parameters ───────────────────────────────────────")
+                        print(f"  vault.liquidate(")
+                        print(f"      violator        = {address}")
+                        print(f"      collateral      = {coll_addr}")
+                        print(f"      repayAssets     = {MAX_UINT256}  (MAX_UINT256)")
+                        print(f"      minYieldBalance = 0")
+                        print(f"  )")
+                        print(f"{'='*70}\n")
 
                         if self.notify:
                             try:
@@ -528,7 +584,8 @@ class AccountMonitor:
                         if self.execute_liquidation:
                             try:
                                 tx_hash, tx_receipt = Liquidator.execute_liquidation(
-                                    liquidation_data["tx"], self.config)
+                                    liquidation_data["tx"], self.config,
+                                    liquidation_data.get("vault_instance"))
                                 if tx_hash and tx_receipt:
                                     print(f"[!!!] LIQUIDATION EXECUTED | tx: {tx_hash}")
                                     if self.notify:
@@ -1062,7 +1119,107 @@ class Liquidator:
             try:
                 collateral_vaults[collateral] = Vault(collateral, config)
             except Exception:  # pylint: disable=broad-except
-                print(f"[LIQ]   → {collateral}: not a valid EVault, skipping")
+                # Not an EVault — print what we can via plain ERC20 + oracle
+                try:
+                    erc20 = create_contract_instance(collateral, config.ERC20_ABI_PATH, config)
+                    dec = erc20.functions.decimals().call()
+                    sym = erc20.functions.symbol().call()
+                    bal = erc20.functions.balanceOf(Web3.to_checksum_address(violator_address)).call()
+                    one_tok = 10 ** dec
+                    try:
+                        lltv_raw = vault.ltv_liquidation(collateral)
+                        lltv_str = f"{lltv_raw / 100:.4f}%"
+                    except Exception:  # pylint: disable=broad-except
+                        lltv_str = "N/A"
+                    try:
+                        oracle = create_contract_instance(vault.oracle_address, config.ORACLE_ABI_PATH, config)
+                        price_raw = oracle.functions.getQuote(
+                            one_tok,
+                            Web3.to_checksum_address(collateral),
+                            Web3.to_checksum_address(vault.unit_of_account)
+                        ).call()
+                        price_str = _fmt_uoa(price_raw, vault.unit_of_account, config)
+                    except Exception:  # pylint: disable=broad-except
+                        price_str = "N/A"
+                    print(f"[LIQ]   Collateral (ERC20): {sym} ({collateral})")
+                    print(f"[LIQ]   LLTV             : {lltv_str}")
+                    print(f"[LIQ]   Balance          : {bal / one_tok:.8f} {sym}")
+                    print(f"[LIQ]   Oracle price     : {price_str} per token")
+                    print(f"[LIQ]   → non-EVault collateral — calling checkLiquidation on debt vault anyway")
+                    try:
+                        (max_repay_erc20, seized_erc20) = vault.check_liquidation(
+                            violator_address, collateral, config.LIQUIDATOR_EOA)
+                        if max_repay_erc20 == 0 or seized_erc20 == 0:
+                            print(f"[LIQ]   → checkLiquidation: max_repay={max_repay_erc20}, "
+                                  f"seized={seized_erc20} → not liquidatable")
+                        else:
+                            print(f"[LIQ]   → checkLiquidation: max_repay={max_repay_erc20} | "
+                                  f"seized={seized_erc20} → LIQUIDATABLE")
+                            MAX_UINT256 = 2**256 - 1
+                            ZERO_ERC20 = "0x0000000000000000000000000000000000000000"
+                            evc_erc20 = config.evc
+                            enable_ctrl_erc20 = evc_erc20.encode_abi(
+                                "enableController",
+                                [config.LIQUIDATOR_EOA, Web3.to_checksum_address(vault.address)]
+                            )
+                            enable_col_erc20 = evc_erc20.encode_abi(
+                                "enableCollateral",
+                                [config.LIQUIDATOR_EOA, Web3.to_checksum_address(collateral)]
+                            )
+                            liquidate_data_erc20 = vault.instance.encode_abi(
+                                "liquidate",
+                                [Web3.to_checksum_address(violator_address),
+                                 Web3.to_checksum_address(collateral),
+                                 MAX_UINT256,
+                                 0]
+                            )
+                            batch_items_erc20 = [
+                                (config.EVC,                                     ZERO_ERC20,            0, enable_ctrl_erc20),
+                                (config.EVC,                                     ZERO_ERC20,            0, enable_col_erc20),
+                                (Web3.to_checksum_address(vault.address), config.LIQUIDATOR_EOA, 0, liquidate_data_erc20),
+                            ]
+                            suggested_gas_price_erc20 = int(config.w3.eth.gas_price * 1.2)
+                            nonce_erc20 = config.w3.eth.get_transaction_count(config.LIQUIDATOR_EOA)
+                            try:
+                                estimated_gas_erc20 = evc_erc20.functions.batch(batch_items_erc20).estimate_gas({
+                                    "from": config.LIQUIDATOR_EOA,
+                                    "nonce": nonce_erc20,
+                                })
+                                gas_limit_erc20 = int(estimated_gas_erc20 * 1.3)
+                                print(f"[LIQ]   → dry-run OK (ERC20) | estimated gas={estimated_gas_erc20} | using gas_limit={gas_limit_erc20}")
+                            except Exception as eg_err:  # pylint: disable=broad-except
+                                print(f"[LIQ]   → dry-run FAILED (ERC20) — tx would revert, skipping. Reason: {eg_err}")
+                                continue
+                            liquidation_tx_erc20 = evc_erc20.functions.batch(batch_items_erc20).build_transaction({
+                                "chainId":  config.CHAIN_ID,
+                                "from":     config.LIQUIDATOR_EOA,
+                                "nonce":    nonce_erc20,
+                                "gasPrice": suggested_gas_price_erc20,
+                                "gas":      gas_limit_erc20,
+                            })
+                            profit_data_erc20 = {
+                                "tx": liquidation_tx_erc20,
+                                "profit": 1,
+                                "collateral_address": collateral,
+                                "collateral_vault_symbol": sym,
+                                "collateral_asset": collateral,
+                                "leftover_borrow": max_repay_erc20,
+                                "leftover_borrow_in_eth": 0,
+                                "seized_shares": seized_erc20,
+                                "underlying_collateral_received": seized_erc20,
+                                "vault_instance": vault.instance,
+                            }
+                            if profit_data_erc20["profit"] > max_profit_data["profit"]:
+                                max_profit_data = profit_data_erc20
+                                max_profit_params = (
+                                    violator_address, vault.address, borrowed_asset,
+                                    collateral, collateral, max_repay_erc20,
+                                    seized_erc20, config.PROFIT_RECEIVER
+                                )
+                    except Exception as ex_chk:  # pylint: disable=broad-except
+                        print(f"[LIQ]   → checkLiquidation call failed: {ex_chk}")
+                except Exception as ex:  # pylint: disable=broad-except
+                    print(f"[LIQ]   → {collateral}: unrecognised collateral ({ex})")
 
         for collateral, collateral_vault in collateral_vaults.items():
             try:
@@ -1082,7 +1239,7 @@ class Liquidator:
                     shares_balance = collateral_vault.instance.functions.balanceOf(
                         Web3.to_checksum_address(violator_address)).call()
                     underlying_balance = collateral_vault.convert_to_assets(shares_balance) if shares_balance > 0 else 0
-                    token_amount_str = f"{underlying_balance / one_token:.4f} {collateral_vault.vault_symbol}"
+                    token_amount_str = f"{underlying_balance / one_token:.8f} {collateral_vault.vault_symbol}"
                 except Exception:  # pylint: disable=broad-except
                     token_amount_str = "N/A"
 
@@ -1133,10 +1290,11 @@ class Liquidator:
                                      _unused: Any,
                                      config: ChainConfig) -> Tuple[Dict[str, Any], Any]:
         """
-        Check whether a liquidation is available and build a direct EVC batch transaction.
+        Check whether a liquidation is available and build a direct vault.liquidate() transaction.
 
-        The EOA calls evc.batch() to seize collateral and take on the violator's debt at a
-        discount, leaving the debt position open for manual repayment later.
+        The EOA calls liquidate() directly on the debt vault (vault must already have
+        controller/collateral enabled, or the vault handles it internally).
+        repayAssets = MAX_UINT256, minYieldBalance = 0.
         No swap or external API is required — the vault's liquidation math guarantees
         seized_value > repay_value whenever max_repay > 0.
 
@@ -1166,30 +1324,49 @@ class Liquidator:
         print(f"[LIQ]   → checkLiquidation: max_repay={max_repay} | seized_shares={seized_collateral_shares} "
               f"| underlying_received={underlying_collateral_received} → LIQUIDATABLE")
 
-        # Build direct EVC batch: enableController → enableCollateral → liquidate
-        # The EOA takes on the debt and receives collateral shares; no swap or repay here.
-        # disableController is intentionally omitted — debt stays open for manual repayment.
+        # EVC batch: enableController → enableCollateral → liquidate
+        # Must pre-register our EOA as controller+collateral holder before seizing.
+        MAX_UINT256 = 2**256 - 1
         ZERO = "0x0000000000000000000000000000000000000000"
         evc = config.evc
-        enable_ctrl = evc.encodeABI("enableController",
-                                    [config.LIQUIDATOR_EOA, vault.address])
-        enable_col  = evc.encodeABI("enableCollateral",
-                                    [config.LIQUIDATOR_EOA, collateral_vault_address])
-        liquidate   = vault.instance.encodeABI(
+        enable_ctrl = evc.encode_abi(
+            "enableController",
+            [config.LIQUIDATOR_EOA, Web3.to_checksum_address(vault.address)]
+        )
+        enable_col = evc.encode_abi(
+            "enableCollateral",
+            [config.LIQUIDATOR_EOA, Web3.to_checksum_address(collateral_vault_address)]
+        )
+        liquidate_data = vault.instance.encode_abi(
             "liquidate",
-            [violator_address, collateral_vault_address, max_repay, 0]
+            [Web3.to_checksum_address(violator_address),
+             Web3.to_checksum_address(collateral_vault_address),
+             MAX_UINT256,
+             0]
         )
         batch_items = [
-            (config.EVC,        ZERO,                 0, enable_ctrl),
-            (config.EVC,        ZERO,                 0, enable_col),
-            (vault.address,     config.LIQUIDATOR_EOA, 0, liquidate),
+            (config.EVC,                                       ZERO,                  0, enable_ctrl),
+            (config.EVC,                                       ZERO,                  0, enable_col),
+            (Web3.to_checksum_address(vault.address), config.LIQUIDATOR_EOA, 0, liquidate_data),
         ]
         suggested_gas_price = int(config.w3.eth.gas_price * 1.2)
+        nonce = config.w3.eth.get_transaction_count(config.LIQUIDATOR_EOA)
+        try:
+            estimated_gas = evc.functions.batch(batch_items).estimate_gas({
+                "from": config.LIQUIDATOR_EOA,
+                "nonce": nonce,
+            })
+            gas_limit = int(estimated_gas * 1.3)
+            print(f"[LIQ]   → dry-run OK | estimated gas={estimated_gas} | using gas_limit={gas_limit}")
+        except Exception as e:  # pylint: disable=broad-except
+            print(f"[LIQ]   → dry-run FAILED — tx would revert, aborting to save gas. Reason: {e}")
+            return ({"profit": 0}, None)
         liquidation_tx = evc.functions.batch(batch_items).build_transaction({
             "chainId":  config.CHAIN_ID,
             "from":     config.LIQUIDATOR_EOA,
-            "nonce":    config.w3.eth.get_transaction_count(config.LIQUIDATOR_EOA),
+            "nonce":    nonce,
             "gasPrice": suggested_gas_price,
+            "gas":      gas_limit,
         })
 
         params = (
@@ -1207,20 +1384,24 @@ class Liquidator:
             "tx": liquidation_tx,
             "profit": 1,  # sentinel — vault math guarantees seized_value > repay_value
             "collateral_address": collateral_vault_address,
+            "collateral_vault_symbol": collateral_vault.vault_symbol,
             "collateral_asset": collateral_asset,
             "leftover_borrow": max_repay,
             "leftover_borrow_in_eth": 0,
             "seized_shares": seized_collateral_shares,
             "underlying_collateral_received": underlying_collateral_received,
+            "vault_instance": vault.instance,
         }, params)
 
     @staticmethod
-    def execute_liquidation(liquidation_transaction: Dict[str, Any], config: ChainConfig) -> None:
+    def execute_liquidation(liquidation_transaction: Dict[str, Any], config: ChainConfig,
+                            debt_vault_instance=None) -> None:
         """
         Execute a liquidation transaction.
 
         Args:
             liquidation_transaction (Dict[str, Any]): The liquidation transaction details.
+            debt_vault_instance: Optional vault contract instance to parse Liquidate events from.
         """
         try:
             signed_tx = config.w3.eth.account.sign_transaction(liquidation_transaction,
@@ -1228,13 +1409,22 @@ class Liquidator:
             tx_hash = config.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             tx_receipt = config.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
-            liquidator_contract = config.liquidator
+            status = "SUCCESS" if tx_receipt.status == 1 else "REVERTED"
+            print(f"[LIQ] Tx {status} | hash={tx_hash.hex()} | block={tx_receipt.blockNumber} | gas={tx_receipt.gasUsed}")
 
-            result = liquidator_contract.events.Liquidation().process_receipt(
-                tx_receipt, errors=DISCARD)
-
-            for event in result:
-                print(f"[LIQ] On-chain result: {event['args']}")
+            if debt_vault_instance:
+                try:
+                    events = debt_vault_instance.events.Liquidate().process_receipt(
+                        tx_receipt, errors=DISCARD)
+                    for ev in events:
+                        a = ev['args']
+                        print(f"[LIQ] Liquidate event: liquidator={a.get('liquidator')} | "
+                              f"violator={a.get('violator')} | "
+                              f"collateral={a.get('collateral')} | "
+                              f"repaidAssets={a.get('repaidAssets')} | "
+                              f"yieldBalance={a.get('yieldBalance')}")
+                except Exception:  # pylint: disable=broad-except
+                    pass
 
             return tx_hash.hex(), tx_receipt
         except Exception as ex: # pylint: disable=broad-except
